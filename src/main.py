@@ -1,12 +1,19 @@
 import json
+from collections import namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, List, Literal, Optional, Tuple, Union
 
+from datasets import load_dataset
 from setproctitle import setproctitle
 
 from transformers import (
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
     HfArgumentParser,
     Seq2SeqTrainingArguments,
+    Trainer,
     set_seed,
 )
 from transformers import logging as hf_logging
@@ -14,7 +21,56 @@ from transformers.utils import is_sagemaker_mp_enabled
 
 
 @dataclass
-class CLSTrainingArguments(Seq2SeqTrainingArguments):
+class TrainPipelineArguments:
+    model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."}
+    )
+    attn_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "어떤 attention 연산 방식을 사용할지 결정하는 값, default가 eager임, eager, flash_attention_2, sdpa중 하나 고르셈."
+        },
+    )
+    packing_max_elem: int = field(
+        default=10,
+        metadata={"help": ""},
+    )
+    do_packing: bool = field(
+        default=True,
+        metadata={"help": ""},
+    )
+    packing_shuffle: bool = field(
+        default=True,
+        metadata={"help": "packing shuffle"},
+    )
+    freeze_named_param: List[str] = field(
+        default=None,
+        metadata={"help": "freeze_named_param"},
+    )
+    profiling: bool = field(
+        default=False,
+        metadata={"help": "profiling"},
+    )
+    profiling_kwargs: Optional[Union[dict, str]] = field(
+        default="{}",
+        metadata={"help": "profiling_kwargs"},
+    )
+    config_kwargs: Optional[Union[dict, str]] = field(
+        default="{}",
+        metadata={"help": ""},
+    )
+    model_kwargs: Optional[Union[dict, str]] = field(
+        default="{}",
+        metadata={"help": ""},
+    )
+    processor_kwargs: Optional[Union[dict, str]] = field(
+        default="{}",
+        metadata={"help": ""},
+    )
+
+
+@dataclass
+class CLSTrainingArguments(Seq2SeqTrainingArguments, TrainPipelineArguments):
     output_dir: str = field(
         default=None,
         metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
@@ -25,75 +81,6 @@ class CLSTrainingArguments(Seq2SeqTrainingArguments):
             raise ValueError("output_dir은 무조건 설정되어 있어야 한다.")
 
         super().__post_init__()
-
-        def _convert_str_dict(passed_value: dict):
-            "Safely checks that a passed value is a dictionary and converts any string values to their appropriate types."
-            for key, value in passed_value.items():
-                if isinstance(value, dict):
-                    passed_value[key] = _convert_str_dict(value)
-                elif isinstance(value, str):
-                    # First check for bool and convert
-                    if value.lower() in ("true", "false"):
-                        passed_value[key] = value.lower() == "true"
-                    # Check for digit
-                    elif value.isdigit():
-                        passed_value[key] = int(value)
-                    elif value.replace(".", "", 1).isdigit():
-                        passed_value[key] = float(value)
-
-            return passed_value
-
-        _ADDITIONAL_VALID_DICT_FILEDS = [
-            "data_truncate_map",
-            "data_name_map",
-            "config_kwargs",
-            "model_kwargs",
-            "tokenizer_kwargs",
-        ]
-        _VALID_LIST_FIELDS = [
-            "instruction_template",
-            "response_template",
-            "train_dataset_prefix",
-            "valid_dataset_prefix",
-            "test_dataset_prefix",
-            "freeze_named_param",
-        ]
-
-        # copied from: transformers/training_args.py/__post_init__()
-        for field in _ADDITIONAL_VALID_DICT_FILEDS:
-            passed_value = getattr(self, field)
-            # We only want to do this if the str starts with a bracket to indiciate a `dict`
-            # else its likely a filename if supported
-            if isinstance(passed_value, str) and passed_value.startswith("{"):
-                loaded_dict = json.loads(passed_value)
-                # Convert str values to types if applicable
-                loaded_dict = _convert_str_dict(loaded_dict)
-                setattr(self, field, loaded_dict)
-            elif isinstance(passed_value, dict) or passed_value is None:
-                pass
-            else:
-                raise ValueError(f"{field}은 dict로 설정해야 함.")
-
-        for field in _VALID_LIST_FIELDS:
-            passed_value = getattr(self, field)
-            if isinstance(passed_value, str) and passed_value.startswith("["):
-                loaded_list = json.loads(passed_value)
-                setattr(self, field, loaded_list)
-            elif isinstance(passed_value, list) or passed_value is None:
-                pass
-            else:
-                raise ValueError(f"{field}은 list로 설정해야 함.")
-
-        self.config_kwargs = {
-            **self.config_kwargs,
-            "attn_implementation": self.attn_implementation,
-        }
-
-        self.cache_dir = Path(self.cache_dir) if self.cache_dir else None
-        self.model_name_or_path = self.resume_from_checkpoint or self.model_name_or_path
-
-        if self.group_by_length:
-            logger.warning("group_by_length이 True임! loss계산에 영향을 끼칠 수 있으니 확인해.")
 
     @property
     def is_local_process_zero(self) -> bool:
@@ -114,11 +101,60 @@ logger = hf_logging.get_logger("transformers")
 
 
 def main(train_args: CLSTrainingArguments) -> None:
-    pass
+    def processor(example):
+        finish_data_ls = list()
+        for data_row in list(zip(*[example[key] for key in example])):
+            data_row = {key: value for key, value in zip(example.keys(), data_row)}  # noqa: C416
+            situation, disease, emotion = f"[{data_row['situation']}]", f"[{data_row['disease']}]", data_row["emotion"]
+            age, gender = f"[{data_row['metadata']['age']}]", f"[{data_row['metadata']['gender']}]"
 
+            if emotion not in model.config.label2id:
+                continue
 
-if "__main__" in __name__:
-    main()
+            text = tokenizer.apply_chat_template(
+                # [{"role": "system", "content": f"{situation}{disease}{age}{gender}"}, *data_row["conversations"]],
+                data_row["conversations"],
+                tokenize=False,
+            )
+
+            output = tokenizer(text, return_length=True)
+            output["labels"] = model.config.label2id[emotion]
+
+            finish_data_ls.append(output)
+
+        return_dict = dict()
+        for res in finish_data_ls:
+            for key, value in res.items():
+                return_dict.setdefault(key, []).append(value)
+        return return_dict
+
+    config = AutoConfig.from_pretrained(train_args.model_name_or_path, _attn_implementation="eager")
+    model = AutoModelForSequenceClassification.from_pretrained(
+        train_args.model_name_or_path,
+        ignore_mismatched_sizes=True,
+        config=config,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(train_args.model_name_or_path)
+    dataset = load_dataset("jp1924/EmotionalDialogueCorpus")
+
+    with train_args.main_process_first():
+        dataset = dataset.map(
+            processor,
+            num_proc=4,
+            batched=True,
+            remove_columns=dataset["train"].column_names,
+            load_from_cache_file=True,
+        )
+
+    trainer = Trainer(
+        model=model,
+        args=train_args,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["validation"],
+        processing_class=tokenizer,
+    )
+    trainer.train()
+
 
 if "__main__" in __name__:
     parser = HfArgumentParser([CLSTrainingArguments])
@@ -134,3 +170,9 @@ if "__main__" in __name__:
         setproctitle(train_args.run_name)
 
     main(train_args)
+
+{
+    "a": [1, 2, 3, 4],
+    "b": ["1", "2", "3", "4"],
+    "c": [1, 2, 3, 4],
+}
